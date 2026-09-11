@@ -1,0 +1,13 @@
+# 构建产物
+dist/
+build/
+*.spec
+NetSwitch.exe
+
+# 运行时配置
+netswitch_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
