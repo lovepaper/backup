@@ -1,10 +1,9 @@
-# 构建产物
+# 构建中间产物（最终 exe 已入库，这里只忽略过程文件）
 dist/
 build/
 *.spec
-NetSwitch.exe
 
-# 运行时配置
+# 运行时配置（含本机网卡名等，不入库）
 netswitch_config.json
 
 # Python
