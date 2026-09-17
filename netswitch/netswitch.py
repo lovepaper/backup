@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-NetSwitch - PC 网络控制开关
-面向测试工作：快速整机断网 / 只掐单个应用的网络 / 循环模拟弱网抖动
+NetSwitch - 跨平台网络控制开关
+面向测试工作：
+  模式一 · 整机断网（禁用 / 启用网卡）
+  模式二 · 循环断网（模拟网络抖动 / 反复重连）
+  模式三 · 只掐单个应用的网络（仅 Windows；macOS 系统限制不支持）
+  模式四 · 弱网模拟（系统级：带宽 / 延迟 / 丢包 / 抖动 / 乱序）
 
-所有开关操作均需管理员权限。
+Windows：网卡用 netsh / PowerShell，应用阻断用 Windows 防火墙，弱网用 WinDivert。
+macOS ：网卡用 networksetup，弱网用 pfctl + dnctl（dummynet）。
+
+所有开关操作均需管理员 / root 权限。
 """
 
 import os
@@ -11,6 +18,7 @@ import sys
 import json
 import time
 import ctypes
+import random
 import hashlib
 import threading
 import subprocess
@@ -20,62 +28,53 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 APP_NAME = "NetSwitch"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 RULE_PREFIX = "NetSwitch_Block_"
 TASK_NAME = "NetSwitch_Admin_Launcher"
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
 
 _BASE = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(_BASE, "netswitch_config.json")
 
-# 虚拟机/隧道类网卡，全部操作时默认跳过，避免搞挂 Docker / WSL / VMware / VPN
-VIRTUAL_KEYWORDS = (
+FONT = ("Helvetica", 10) if IS_MAC else ("Microsoft YaHei UI", 10)
+
+# 虚拟机/隧道类网卡（Windows）
+WIN_VIRTUAL_KEYWORDS = (
     "hyper-v", "vethernet", "vmware", "virtualbox", "vbox", "wsl",
     "tap-windows", "tap-win32", "zerotier", "tailscale", "openvpn",
     "virtual", "loopback", "npf_", "npcap", "docker", "bluetooth", "miniport",
 )
+# macOS 虚拟/非物理服务
+MAC_VIRTUAL_KEYWORDS = (
+    "bridge", "vpn", "virtual", "utun", "bluetooth", "iphone", "pan",
+    "ppp", "tap", "tun", "thunderbolt bridge", "usb tether",
+)
 
-# 全局热键依赖 keyboard 库，缺失时功能自动降级
+# 全局热键依赖 keyboard 库（仅 Windows 有意义），缺失时自动降级
 try:
     import keyboard  # type: ignore
-    HAS_KEYBOARD = True
+    HAS_KEYBOARD = True and IS_WIN
 except Exception:
     HAS_KEYBOARD = False
 
 
 # --------------------------------------------------------------------------
-# 基础工具
+# 跨平台基础工具
 # --------------------------------------------------------------------------
-def is_admin() -> bool:
+def run_cmd(cmd, shell=None, timeout=25):
+    """执行命令，返回 (ok, text)。cmd 为 str 时走 shell，list 时直接 exec。"""
+    if shell is None:
+        shell = isinstance(cmd, str)
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def elevate() -> bool:
-    """以管理员身份重新拉起本程序"""
-    try:
-        if getattr(sys, "frozen", False):
-            exe, arg = sys.executable, ""
-        else:
-            exe, arg = sys.executable, '"%s"' % os.path.abspath(__file__)
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, arg, os.getcwd(), 1)
-        return rc > 32
-    except Exception:
-        return False
-
-
-def run_cmd(cmd, shell=True, timeout=25):
-    """执行命令，返回 (ok, text)"""
-    try:
-        p = subprocess.run(
-            cmd, shell=shell, capture_output=True, timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        kwargs = dict(capture_output=True, timeout=timeout)
+        if not shell and IS_WIN:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        p = subprocess.run(cmd, shell=shell, **kwargs)
         out = (p.stdout or b"") + (p.stderr or b"")
         text = ""
-        for enc in ("utf-8", "gbk"):
+        for enc in ("utf-8", "gbk", "latin-1"):
             try:
                 text = out.decode(enc)
                 break
@@ -90,8 +89,28 @@ def run_cmd(cmd, shell=True, timeout=25):
         return False, str(e)
 
 
-def ps_json(script, timeout=25):
-    """执行 PowerShell 脚本并解析 JSON 输出"""
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Windows 实现
+# --------------------------------------------------------------------------
+def win_ps_json(script, timeout=25):
     ok, text = run_cmd([
         "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script
@@ -116,41 +135,8 @@ def ps_json(script, timeout=25):
             return None
 
 
-def ps_lines(script, timeout=25):
-    """执行 PowerShell 脚本并返回非空输出行"""
-    ok, text = run_cmd([
-        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script
-    ], shell=False, timeout=timeout)
-    if not ok:
-        return []
-    return [l.strip() for l in text.splitlines() if l.strip()]
-
-
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-# --------------------------------------------------------------------------
-# 网卡操作（模式一：整机断网）
-# --------------------------------------------------------------------------
-def list_adapters():
-    """返回 [{'name','desc','status'}]，status ∈ Up/Disabled/Disconnected/Not Present"""
-    data = ps_json(
+def win_list_adapters():
+    data = win_ps_json(
         "Get-NetAdapter -ErrorAction SilentlyContinue | "
         "Select-Object Name,InterfaceDescription,Status | ConvertTo-Json -Compress"
     )
@@ -168,14 +154,12 @@ def list_adapters():
     return res
 
 
-def is_virtual(ad):
-    """判断是否为虚拟网卡/隧道网卡"""
+def win_is_virtual(ad):
     blob = ("%s %s" % (ad.get("name", ""), ad.get("desc", ""))).lower()
-    return any(k in blob for k in VIRTUAL_KEYWORDS)
+    return any(k in blob for k in WIN_VIRTUAL_KEYWORDS)
 
 
-def status_kind(ad):
-    """返回 up / disabled / disconnected / absent"""
+def win_status_kind(ad):
     s = str(ad.get("status", "")).strip().lower()
     if s.startswith("disabled"):
         return "disabled"
@@ -186,77 +170,58 @@ def status_kind(ad):
     return "disconnected"
 
 
-def set_adapter(name, enable):
-    """启用/禁用单张网卡"""
+def win_set_adapter(name, enable):
     verb = "enable" if enable else "disable"
-    return run_cmd('netsh interface set interface name="%s" admin=%s' % (name, verb), timeout=30)
-
-
-def set_adapter_ps(name, enable):
-    """netsh 失败时的兜底方案"""
-    verb = "Enable-NetAdapter" if enable else "Disable-NetAdapter"
-    ok, out = run_cmd(
-        'powershell -NoProfile -ExecutionPolicy Bypass -Command '
-        '%s -Name "%s" -Confirm:$false -ErrorAction Stop' % (verb, name)
-    )
-    return ok, out
-
-
-def toggle_adapter_smart(name, enable):
-    """先 netsh，失败再 PowerShell"""
-    ok, out = set_adapter(name, enable)
+    ok, out = run_cmd('netsh interface set interface name="%s" admin=%s' % (name, verb), timeout=30)
     if not ok:
-        ok2, out2 = set_adapter_ps(name, enable)
-        return ok2, out + " || " + out2
+        verb2 = "Enable-NetAdapter" if enable else "Disable-NetAdapter"
+        ok, out2 = run_cmd(
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command '
+            '%s -Name "%s" -Confirm:$false -ErrorAction Stop' % (verb2, name))
+        return ok, out + " || " + out2
     return ok, out
 
 
-def ping_once(host="223.5.5.5", timeout_ms=1500):
+def win_ping_once(host="223.5.5.5", timeout_ms=1500):
     ok, out = run_cmd("ping -n 1 -w %d %s" % (timeout_ms, host), timeout=12)
     return ("TTL=" in out.upper()) or ("time=" in out.lower())
 
 
-# --------------------------------------------------------------------------
-# 防火墙规则（模式二：单应用断网）
-# --------------------------------------------------------------------------
-def rule_name_for(exe_path):
+def win_rule_name_for(exe_path):
     h = hashlib.md5(exe_path.lower().encode("utf-8")).hexdigest()[:8]
     return RULE_PREFIX + h
 
 
-def _missing(out):
+def win_missing(out):
     low = (out or "").lower()
     return ("no rules match" in low) or ("没有匹配的规则" in out) or ("找不到" in out)
 
 
-def app_blocked(exe_path):
-    ok, out = run_cmd('netsh advfirewall firewall show rule name="%s"' % rule_name_for(exe_path))
-    return bool(ok) and not _missing(out)
+def win_app_blocked(exe_path):
+    ok, out = run_cmd('netsh advfirewall firewall show rule name="%s"' % win_rule_name_for(exe_path))
+    return bool(ok) and not win_missing(out)
 
 
-def block_app(exe_path):
-    """阻断指定 exe 的出站 + 入站"""
-    rn = rule_name_for(exe_path)
+def win_block_app(exe_path):
+    rn = win_rule_name_for(exe_path)
     detail = []
     for direction in ("out", "in"):
         ok, out = run_cmd(
             'netsh advfirewall firewall add rule name="%s" dir=%s action=block '
-            'program="%s" enable=yes profile=any' % (rn, direction, exe_path)
-        )
+            'program="%s" enable=yes profile=any' % (rn, direction, exe_path))
         detail.append((direction, ok, out))
     return all(d[1] for d in detail), detail
 
 
-def unblock_app(exe_path):
-    ok, out = run_cmd('netsh advfirewall firewall delete rule name="%s"' % rule_name_for(exe_path))
-    if not ok and _missing(out):
+def win_unblock_app(exe_path):
+    ok, out = run_cmd('netsh advfirewall firewall delete rule name="%s"' % win_rule_name_for(exe_path))
+    if not ok and win_missing(out):
         return True, "规则本就不存在"
     return ok, out
 
 
-def list_netswitch_rules():
-    """返回 [{'name','direction','program'}]"""
-    data = ps_json(
+def win_list_rules():
+    data = win_ps_json(
         "Get-NetFirewallRule -ErrorAction SilentlyContinue | "
         "Where-Object {$_.DisplayName -like '%s*'} | "
         "ForEach-Object { "
@@ -272,13 +237,12 @@ def list_netswitch_rules():
              "program": d.get("Program", "")} for d in data]
 
 
-def delete_rule_by_name(name):
+def win_delete_rule(name):
     return run_cmd('netsh advfirewall firewall delete rule name="%s"' % name)
 
 
-def list_processes():
-    """返回 [(basename, path)]，去重排序"""
-    data = ps_json(
+def win_list_processes():
+    data = win_ps_json(
         "Get-Process -ErrorAction SilentlyContinue | "
         "Where-Object {$_.Path -ne $null -and $_.Path -like '*.exe'} | "
         "Select-Object -ExpandProperty Path -Unique | Sort-Object | ConvertTo-Json -Compress",
@@ -298,21 +262,334 @@ def list_processes():
 
 
 # --------------------------------------------------------------------------
+# macOS 实现
+# --------------------------------------------------------------------------
+def mac_is_admin():
+    return os.geteuid() == 0
+
+
+def mac_run_priv(cmd):
+    """需要特权的命令：已是 root 直接跑，否则加 sudo -n（非交互）"""
+    if mac_is_admin():
+        return run_cmd(cmd, shell=False, timeout=30)
+    return run_cmd(["sudo", "-n"] + list(cmd), shell=False, timeout=30)
+
+
+def mac_list_adapters():
+    ok, out = run_cmd(["networksetup", "-listallnetworkservices"], shell=False, timeout=20)
+    res = []
+    if not ok:
+        return res
+    started = False
+    for ln in out.splitlines():
+        s = ln.strip()
+        if not started:
+            if "denotes" in s.lower() or s.startswith("An asterisk"):
+                started = True
+            continue
+        if not s:
+            continue
+        name = s.replace("*", "").strip()
+        if not name:
+            continue
+        enabled = mac_service_enabled(name)
+        status = "up" if enabled else "disabled"
+        res.append({"name": name, "desc": "", "status": status})
+    return res
+
+
+def mac_service_enabled(name):
+    ok, out = run_cmd(["networksetup", "-getnetworkserviceenabled", name], shell=False, timeout=15)
+    return ok and "enabled" in out.lower()
+
+
+def mac_is_virtual(ad):
+    n = ad.get("name", "").lower()
+    return any(k in n for k in MAC_VIRTUAL_KEYWORDS)
+
+
+def mac_status_kind(ad):
+    s = str(ad.get("status", "")).strip().lower()
+    if s == "disabled":
+        return "disabled"
+    return "up"
+
+
+def mac_set_adapter(name, enable):
+    verb = "on" if enable else "off"
+    return mac_run_priv(["networksetup", "-setnetworkserviceenabled", name, verb])
+
+
+def mac_ping_once(host="223.5.5.5", timeout_ms=1500):
+    ok, out = run_cmd(["ping", "-c", "1", "-W", str(timeout_ms), host], shell=False, timeout=12)
+    low = out.lower()
+    return ("time=" in low) or ("1 packets received" in low) or ("1 received" in low)
+
+
+def mac_list_processes():
+    ok, out = run_cmd(["ps", "-ax", "-o", "pid=,command="], shell=False, timeout=30)
+    res = []
+    seen = set()
+    if ok:
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            parts = ln.split(None, 1)
+            if len(parts) < 2:
+                continue
+            path = parts[1].strip()
+            if path.lower().endswith(".app"):
+                continue
+            if path and os.path.exists(path) and path.lower() not in seen:
+                seen.add(path.lower())
+                res.append((os.path.basename(path), path))
+    res.sort(key=lambda x: x[0].lower())
+    return res
+
+
+def _mac_dnctl_cfg(pipe_no, kbps, latency_ms, loss_pct):
+    if kbps and kbps > 0:
+        args = ["dnctl", "pipe", str(pipe_no), "config", "bw", "%dKbit" % int(kbps)]
+    else:
+        args = ["dnctl", "pipe", str(pipe_no), "config", "bw", "1000000Kbit"]
+    if latency_ms and latency_ms > 0:
+        args += ["delay", str(int(latency_ms))]
+    if loss_pct and loss_pct > 0:
+        args += ["plr", "%.4f" % (loss_pct / 100.0)]
+    return args
+
+
+def mac_set_weak(profile):
+    # 1) 启用 pf
+    mac_run_priv(["pfctl", "-e"])
+    dl = profile.get("dl_kbps") or 0
+    ul = profile.get("ul_kbps") or 0
+    lat = profile.get("latency_ms") or 0
+    loss = profile.get("loss_pct") or 0
+    # 2) 配置两条 dummynet 管道：pipe1 出站(上行)，pipe2 入站(下行)
+    r1 = mac_run_priv(_mac_dnctl_cfg(1, ul, lat, loss))
+    r2 = mac_run_priv(_mac_dnctl_cfg(2, dl, lat, loss))
+    # 3) 写 pf 规则到临时文件并加载到 com.apple.netswitch 锚点
+    rules = "dummynet out proto ip from any to any pipe 1\ndummynet in proto ip from any to any pipe 2\n"
+    tmp = "/tmp/netswitch_pf.conf"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(rules)
+    except Exception as e:
+        return False, "写 pf 规则失败：%s" % e
+    ok, out = mac_run_priv(["pfctl", "-a", "com.apple.netswitch", "-f", tmp])
+    if not ok:
+        return False, "加载 pf 规则失败：%s" % (out or "")[:300]
+    return True, "弱网已开启（系统级 · 带宽/延迟/丢包）"
+
+
+def mac_clear_weak():
+    mac_run_priv(["pfctl", "-a", "com.apple.netswitch", "-F", "all"])
+    mac_run_priv(["dnctl", "-q", "flush"])
+    return True, "弱网已停止，网络已恢复"
+
+
+def mac_weak_active():
+    ok, out = run_cmd(["pfctl", "-a", "com.apple.netswitch", "-s", "rules"], shell=False, timeout=15)
+    return ok and bool(out.strip())
+
+
+# --------------------------------------------------------------------------
+# 平台抽象
+# --------------------------------------------------------------------------
+class WinPlatform:
+    name = "win"
+
+    def is_admin(self):
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def elevate(self):
+        try:
+            if getattr(sys, "frozen", False):
+                exe, arg = sys.executable, ""
+            else:
+                exe, arg = sys.executable, '"%s"' % os.path.abspath(__file__)
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, arg, os.getcwd(), 1)
+            return rc > 32
+        except Exception:
+            return False
+
+    def list_adapters(self):
+        return win_list_adapters()
+
+    def is_virtual(self, ad):
+        return win_is_virtual(ad)
+
+    def status_kind(self, ad):
+        return win_status_kind(ad)
+
+    def set_adapter(self, name, enable):
+        return win_set_adapter(name, enable)
+
+    def ping_once(self, host="223.5.5.5"):
+        return win_ping_once(host)
+
+    def app_blocked(self, path):
+        return win_app_blocked(path)
+
+    def block_app(self, path):
+        return win_block_app(path)
+
+    def unblock_app(self, path):
+        return win_unblock_app(path)
+
+    def list_rules(self):
+        return win_list_rules()
+
+    def delete_rule(self, name):
+        return win_delete_rule(name)
+
+    def list_processes(self):
+        return win_list_processes()
+
+    def weak_supported(self):
+        return True
+
+    def has_jitter_reorder(self):
+        return True
+
+    def app_block_supported(self):
+        return True
+
+    def set_weak(self, profile):
+        try:
+            import windivert_throttle as wd  # 懒加载，失败不影响其它功能
+        except Exception as e:
+            return False, "弱网引擎不可用：%s" % e
+        return wd.start_weak(profile)
+
+    def clear_weak(self):
+        try:
+            import windivert_throttle as wd
+        except Exception:
+            return True, "没有运行中的弱网"
+        return wd.stop_weak()
+
+    def weak_active(self):
+        try:
+            import windivert_throttle as wd
+            return wd.is_active()
+        except Exception:
+            return False
+
+    def weak_stats(self):
+        try:
+            import windivert_throttle as wd
+            return wd.get_stats()
+        except Exception:
+            return {"dropped": 0, "sent": 0, "active": False}
+
+
+class MacPlatform:
+    name = "mac"
+
+    def is_admin(self):
+        return mac_is_admin()
+
+    def elevate(self):
+        try:
+            if getattr(sys, "frozen", False):
+                target = '"%s"' % sys.executable
+                args = ""
+            else:
+                target = '"%s"' % sys.executable
+                args = '"%s"' % os.path.abspath(__file__)
+            script = 'do shell script "%s %s" with administrator privileges' % (target, args)
+            rc = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=30)
+            return rc.returncode == 0
+        except Exception:
+            return False
+
+    def list_adapters(self):
+        return mac_list_adapters()
+
+    def is_virtual(self, ad):
+        return mac_is_virtual(ad)
+
+    def status_kind(self, ad):
+        return mac_status_kind(ad)
+
+    def set_adapter(self, name, enable):
+        return mac_set_adapter(name, enable)
+
+    def ping_once(self, host="223.5.5.5"):
+        return mac_ping_once(host)
+
+    def app_blocked(self, path):
+        return False
+
+    def block_app(self, path):
+        return False, "macOS 不支持按进程精准断网（系统限制），请用弱网或整机断网模式"
+
+    def unblock_app(self, path):
+        return True, "macOS 无需放行"
+
+    def list_rules(self):
+        return []
+
+    def delete_rule(self, name):
+        return True, ""
+
+    def list_processes(self):
+        return mac_list_processes()
+
+    def weak_supported(self):
+        return True
+
+    def has_jitter_reorder(self):
+        return False  # macOS dummynet 不支持抖动/乱序
+
+    def app_block_supported(self):
+        return False
+
+    def set_weak(self, profile):
+        if not self.is_admin():
+            return False, "需要 root 权限，请点「以 root 重启」"
+        return mac_set_weak(profile)
+
+    def clear_weak(self):
+        if not self.is_admin():
+            return True, "没有运行中的弱网"
+        return mac_clear_weak()
+
+    def weak_active(self):
+        return mac_weak_active()
+
+    def weak_stats(self):
+        return {"dropped": 0, "sent": 0, "active": self.weak_active()}
+
+
+def get_platform():
+    return MacPlatform() if IS_MAC else WinPlatform()
+
+
+# --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 class NetSwitchApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("%s v%s - PC 网络控制开关" % (APP_NAME, APP_VERSION))
-        self.root.geometry("780x680")
-        self.root.minsize(720, 620)
+        self.platform = get_platform()
+        self.root.title("%s v%s - 网络控制开关" % (APP_NAME, APP_VERSION))
+        self.root.geometry("800x760" if IS_MAC else "780x700")
+        self.root.minsize(720, 680)
 
         self.cfg = load_config()
         self.adapters = []
         self.rules = []
-        self.row_map = {}        # listbox index -> rule dict
+        self.row_map = {}
         self._stop_event = threading.Event()
         self._worker = None
+        self._weak_active = False
 
         self.BG, self.CARD = "#f4f5f7", "#ffffff"
         self.FG, self.MUTED = "#1f2328", "#6b7280"
@@ -327,36 +604,34 @@ class NetSwitchApp:
         if HAS_KEYBOARD:
             self._bind_hotkeys()
 
-    # ---------------- 样式 ----------------
     def _build_style(self):
         st = ttk.Style()
         try:
             st.theme_use("clam")
         except Exception:
             pass
-        st.configure(".", background=self.BG, foreground=self.FG, fieldbackground="#ffffff")
+        st.configure(".", background=self.BG, foreground=self.FG, fieldbackground="#ffffff", font=FONT)
         st.configure("TFrame", background=self.BG)
         st.configure("Card.TFrame", background=self.CARD)
-        st.configure("TLabel", background=self.BG, foreground=self.FG, font=("Microsoft YaHei UI", 10))
-        st.configure("Card.TLabel", background=self.CARD, foreground=self.FG)
+        st.configure("TLabel", background=self.BG, foreground=self.FG, font=FONT)
+        st.configure("Card.TLabel", background=self.CARD, foreground=self.FG, font=FONT)
         st.configure("Title.TLabel", background=self.CARD, foreground=self.FG,
-                     font=("Microsoft YaHei UI", 12, "bold"))
-        st.configure("Muted.TLabel", background=self.CARD, foreground=self.MUTED,
-                     font=("Microsoft YaHei UI", 9))
-        st.configure("TButton", font=("Microsoft YaHei UI", 10), padding=6)
-        st.configure("TCheckbutton", background=self.CARD, foreground=self.FG)
-        st.configure("TCombobox", font=("Microsoft YaHei UI", 10))
-        st.configure("TEntry", font=("Microsoft YaHei UI", 10))
-        st.configure("TSpinbox", font=("Microsoft YaHei UI", 10))
+                     font=(FONT[0], 12, "bold"))
+        st.configure("Muted.TLabel", background=self.CARD, foreground=self.MUTED, font=(FONT[0], 9))
+        st.configure("TButton", font=FONT, padding=6)
+        st.configure("TCheckbutton", background=self.CARD, foreground=self.FG, font=FONT)
+        st.configure("TCombobox", font=FONT)
+        st.configure("TEntry", font=FONT)
+        st.configure("TSpinbox", font=FONT)
 
     def _card(self):
         return ttk.Frame(self.root, style="Card.TFrame", padding=14)
 
-    # ---------------- UI ----------------
     def _build_ui(self):
         top = self._card()
         top.pack(fill="x", padx=12, pady=(12, 6))
-        ttk.Label(top, text="%s   PC 网络控制开关" % APP_NAME, style="Title.TLabel").pack(side="left")
+        ttk.Label(top, text="%s   %s 网络控制开关" % (APP_NAME, "macOS" if IS_MAC else "PC"),
+                  style="Title.TLabel").pack(side="left")
         self.admin_var = tk.StringVar(value="")
         self.admin_lbl = ttk.Label(top, textvariable=self.admin_var, style="Muted.TLabel")
         self.admin_lbl.pack(side="right")
@@ -364,17 +639,23 @@ class NetSwitchApp:
 
         self._build_net_card()
         self._build_loop_card()
-        self._build_app_card()
+        if self.platform.app_block_supported():
+            self._build_app_card()
+        else:
+            self._build_app_note()
+        self._build_weak_card()
         self._build_log_card()
 
         bot = ttk.Frame(self.root, padding=(12, 4))
         bot.pack(fill="x")
-        tip = "热键：Ctrl+Alt+K 断网 / Ctrl+Alt+R 恢复 / Ctrl+Alt+S 停止任务" if HAS_KEYBOARD \
-            else "（未检测到 keyboard 库，全局热键不可用）"
+        tip = ("热键：Ctrl+Alt+K 断网 / Ctrl+Alt+R 恢复 / Ctrl+Alt+S 停止任务" if HAS_KEYBOARD
+               else "（未检测到 keyboard 库，全局热键不可用）")
         ttk.Label(bot, text=tip, style="Muted.TLabel").pack(side="left")
-        self.btn_task = ttk.Button(bot, text="创建免UAC快捷方式", command=self.create_uac_free)
-        self.btn_task.pack(side="right")
-        self.btn_elevate = ttk.Button(bot, text="以管理员重启", command=self.do_elevate)
+        if IS_WIN:
+            self.btn_task = ttk.Button(bot, text="创建免UAC快捷方式", command=self.create_uac_free)
+            self.btn_task.pack(side="right")
+        self.btn_elevate = ttk.Button(bot, text="以管理员重启" if IS_WIN else "以 root 重启",
+                                      command=self.do_elevate)
         self.btn_elevate.pack(side="right", padx=(0, 8))
 
     def _build_net_card(self):
@@ -384,15 +665,16 @@ class NetSwitchApp:
 
         row = ttk.Frame(c, style="Card.TFrame")
         row.pack(fill="x", pady=(10, 6))
-        ttk.Label(row, text="网卡：", style="Card.TLabel").pack(side="left")
+        ttk.Label(row, text="网卡/服务：", style="Card.TLabel").pack(side="left")
         self.adapter_var = tk.StringVar()
-        self.adapter_cb = ttk.Combobox(row, textvariable=self.adapter_var, state="readonly", width=44)
+        self.adapter_cb = ttk.Combobox(row, textvariable=self.adapter_var, state="readonly", width=40)
         self.adapter_cb.pack(side="left", padx=(4, 10))
         self.adapter_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_net_status())
         ttk.Button(row, text="刷新", command=self.refresh_all, width=8).pack(side="left")
-        self.phys_only_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="批量操作时跳过虚拟网卡", variable=self.phys_only_var,
-                        style="TCheckbutton").pack(side="left", padx=(14, 0))
+        if IS_WIN:
+            self.phys_only_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(row, text="批量操作时跳过虚拟网卡", variable=self.phys_only_var,
+                            style="TCheckbutton").pack(side="left", padx=(14, 0))
 
         st = ttk.Frame(c, style="Card.TFrame")
         st.pack(fill="x", pady=(0, 8))
@@ -410,12 +692,11 @@ class NetSwitchApp:
         self.btn_off.pack(side="left")
         self.btn_on = ttk.Button(bro, text="恢复网络", command=lambda: self.net_toggle(True), width=14)
         self.btn_on.pack(side="left", padx=(10, 0))
-        self.btn_off_all = ttk.Button(bro, text="断开全部网卡", command=lambda: self.net_toggle_all(False),
-                                      width=14)
-        self.btn_off_all.pack(side="left", padx=(10, 0))
-        self.btn_on_all = ttk.Button(bro, text="恢复全部网卡", command=lambda: self.net_toggle_all(True),
-                                     width=14)
-        self.btn_on_all.pack(side="left", padx=(10, 0))
+        if IS_WIN:
+            self.btn_off_all = ttk.Button(bro, text="断开全部网卡", command=lambda: self.net_toggle_all(False), width=14)
+            self.btn_off_all.pack(side="left", padx=(10, 0))
+            self.btn_on_all = ttk.Button(bro, text="恢复全部网卡", command=lambda: self.net_toggle_all(True), width=14)
+            self.btn_on_all.pack(side="left", padx=(10, 0))
 
         ar = ttk.Frame(c, style="Card.TFrame")
         ar.pack(fill="x", pady=(8, 0))
@@ -494,6 +775,75 @@ class NetSwitchApp:
         ttk.Label(c, text="提示：规则只对新连接生效，已建立的长连接建议重启被测程序。",
                   style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
+    def _build_app_note(self):
+        c = self._card()
+        c.pack(fill="x", padx=12, pady=6)
+        ttk.Label(c, text="模式三 · 单应用断网（本平台不可用）", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(c, text="macOS 系统限制：pf 防火墙无法按进程/端口精准阻断单个 App 的出站流量。\n"
+                          "需要单独掐某个程序时，请用「模式四 · 弱网」对整个系统限速，或用「模式一」整机断网。",
+                  style="Card.TLabel").pack(anchor="w", pady=(8, 0))
+
+    def _build_weak_card(self):
+        c = self._card()
+        c.pack(fill="x", padx=12, pady=6)
+        ttk.Label(c, text="模式四 · 弱网模拟（系统级：所有流量受影响）", style="Title.TLabel").pack(anchor="w")
+
+        r1 = ttk.Frame(c, style="Card.TFrame")
+        r1.pack(fill="x", pady=(10, 4))
+        ttk.Label(r1, text="下行带宽(kbps)：", style="Card.TLabel").pack(side="left")
+        self.dl_var = tk.StringVar(value=str(self.cfg.get("dl_kbps", 0)))
+        ttk.Spinbox(r1, from_=0, to=1000000, width=10, textvariable=self.dl_var,
+                    command=self._persist_weak).pack(side="left", padx=(4, 10))
+        ttk.Label(r1, text="上行带宽(kbps)：", style="Card.TLabel").pack(side="left")
+        self.ul_var = tk.StringVar(value=str(self.cfg.get("ul_kbps", 0)))
+        ttk.Spinbox(r1, from_=0, to=1000000, width=10, textvariable=self.ul_var,
+                    command=self._persist_weak).pack(side="left", padx=(4, 10))
+        ttk.Label(r1, text="(0 = 不限速)", style="Muted.TLabel").pack(side="left")
+
+        preset = ttk.Frame(c, style="Card.TFrame")
+        preset.pack(fill="x", pady=(0, 4))
+        ttk.Label(preset, text="快速档：", style="Card.TLabel").pack(side="left")
+        for lbl, v in (("64K", 64), ("256K", 256), ("1M", 1000), ("10M", 10000), ("100M", 100000)):
+            ttk.Button(preset, text=lbl, width=6,
+                       command=lambda vv=v: self._apply_preset(vv)).pack(side="left", padx=(2, 0))
+
+        r2 = ttk.Frame(c, style="Card.TFrame")
+        r2.pack(fill="x", pady=(0, 4))
+        ttk.Label(r2, text="延迟(ms)：", style="Card.TLabel").pack(side="left")
+        self.lat_var = tk.StringVar(value=str(self.cfg.get("latency_ms", 0)))
+        ttk.Spinbox(r2, from_=0, to=5000, width=8, textvariable=self.lat_var,
+                    command=self._persist_weak).pack(side="left", padx=(4, 10))
+        ttk.Label(r2, text="抖动(ms)：", style="Card.TLabel").pack(side="left")
+        self.jit_var = tk.StringVar(value=str(self.cfg.get("jitter_ms", 0)))
+        self.jit_spin = ttk.Spinbox(r2, from_=0, to=2000, width=8, textvariable=self.jit_var,
+                                    command=self._persist_weak)
+        self.jit_spin.pack(side="left", padx=(4, 10))
+        ttk.Label(r2, text="丢包(%)：", style="Card.TLabel").pack(side="left")
+        self.loss_var = tk.StringVar(value=str(self.cfg.get("loss_pct", 0)))
+        ttk.Spinbox(r2, from_=0, to=100, width=8, textvariable=self.loss_var,
+                    command=self._persist_weak).pack(side="left", padx=(4, 10))
+        ttk.Label(r2, text="乱序(%)：", style="Card.TLabel").pack(side="left")
+        self.reord_var = tk.StringVar(value=str(self.cfg.get("reorder_pct", 0)))
+        self.reord_spin = ttk.Spinbox(r2, from_=0, to=100, width=8, textvariable=self.reord_var,
+                                      command=self._persist_weak)
+        self.reord_spin.pack(side="left", padx=(4, 10))
+        if not self.platform.has_jitter_reorder():
+            self.jit_spin.configure(state="disabled")
+            self.reord_spin.configure(state="disabled")
+            ttk.Label(r2, text="(macOS dummynet 不支持抖动/乱序)", style="Muted.TLabel").pack(side="left", padx=(8, 0))
+
+        bro = ttk.Frame(c, style="Card.TFrame")
+        bro.pack(fill="x", pady=(6, 0))
+        self.btn_weak_on = ttk.Button(bro, text="开始弱网", command=self.weak_start, width=14)
+        self.btn_weak_on.pack(side="left")
+        self.btn_weak_off = ttk.Button(bro, text="停止弱网", command=self.weak_stop, width=14,
+                                       state="disabled")
+        self.btn_weak_off.pack(side="left", padx=(10, 0))
+        self.weak_state_var = tk.StringVar(value="")
+        ttk.Label(bro, textvariable=self.weak_state_var, style="Muted.TLabel").pack(side="left", padx=(16, 0))
+        ttk.Label(c, text="弱网对所有进出流量生效，开启后建议重启被测程序再观察。停止后恢复原速。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+
     def _build_log_card(self):
         c = self._card()
         c.pack(fill="both", expand=True, padx=12, pady=6)
@@ -527,12 +877,17 @@ class NetSwitchApp:
     def _busy(self, flag):
         def _p():
             state = "disabled" if flag else "normal"
-            for b in (self.btn_off, self.btn_on, self.btn_off_all, self.btn_on_all,
-                      self.btn_block, self.btn_unblock, self.btn_clear_rules):
+            for b in (self.btn_off, self.btn_on):
                 try:
                     b.configure(state=state)
                 except Exception:
                     pass
+            if IS_WIN:
+                for b in (self.btn_off_all, self.btn_on_all):
+                    try:
+                        b.configure(state=state)
+                    except Exception:
+                        pass
         self.root.after(0, _p)
 
     def _persist_opts(self):
@@ -548,22 +903,42 @@ class NetSwitchApp:
         except Exception:
             pass
 
+    def _persist_weak(self):
+        try:
+            self.cfg.update({
+                "dl_kbps": int(self.dl_var.get() or 0),
+                "ul_kbps": int(self.ul_var.get() or 0),
+                "latency_ms": int(self.lat_var.get() or 0),
+                "jitter_ms": int(self.jit_var.get() or 0),
+                "loss_pct": int(self.loss_var.get() or 0),
+                "reorder_pct": int(self.reord_var.get() or 0),
+            })
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def _apply_preset(self, v):
+        self.dl_var.set(str(v))
+        self.ul_var.set(str(v))
+        self._persist_weak()
+
     def ensure_admin(self):
-        if is_admin():
+        if self.platform.is_admin():
             return True
         messagebox.showwarning(
-            "需要管理员权限",
-            "开关网卡 / 改防火墙规则必须管理员权限。\n\n"
-            "请点右下角「以管理员重启」，或关闭后右键 → 以管理员身份运行。"
-        )
+            "需要权限",
+            "开关网卡 / 改防火墙 / 弱网都需要管理员(root)权限。\n\n"
+            "请点右下角「%s」后重试。" % ("以 root 重启" if IS_MAC else "以管理员重启"))
         return False
 
     # ---------------- 刷新 ----------------
     def refresh_all(self):
         self.refresh_admin()
         threading.Thread(target=lambda: self.root.after(
-            0, lambda: self._apply_adapters(list_adapters())), daemon=True).start()
-        self.refresh_block_list()
+            0, lambda: self._apply_adapters(self.platform.list_adapters())), daemon=True).start()
+        if self.platform.app_block_supported():
+            self.refresh_block_list()
+        self.refresh_weak_state()
 
     def _apply_adapters(self, ads):
         self.adapters = ads
@@ -577,8 +952,8 @@ class NetSwitchApp:
         self.refresh_net_status()
 
     def refresh_admin(self):
-        if is_admin():
-            self.admin_var.set("● 管理员权限 OK")
+        if self.platform.is_admin():
+            self.admin_var.set("● 权限 OK")
             self.admin_lbl.configure(foreground=self.GREEN)
             self.btn_elevate.configure(state="disabled")
         else:
@@ -591,8 +966,8 @@ class NetSwitchApp:
         ad = next((a for a in self.adapters if a["name"] == name), None)
         txt, color = "未选择网卡", self.MUTED
         if ad:
-            kind = status_kind(ad)
-            virt = "（虚拟网卡）" if is_virtual(ad) else ""
+            kind = self.platform.status_kind(ad)
+            virt = "（虚拟网卡）" if self.platform.is_virtual(ad) else ""
             if kind == "up":
                 txt, color = "%s%s：已启用 · 已连接" % (name, virt), self.GREEN
             elif kind == "disabled":
@@ -600,7 +975,7 @@ class NetSwitchApp:
             elif kind == "absent":
                 txt, color = "%s%s：网卡不存在" % (name, virt), self.MUTED
             else:
-                txt, color = "%s%s：已启用 · 网线/WiFi 未连上" % (name, virt), self.ORANGE
+                txt, color = "%s%s：已启用 · 未连上" % (name, virt), self.ORANGE
         self.net_state_var.set(txt)
         self.set_dot(color)
         if name:
@@ -609,7 +984,7 @@ class NetSwitchApp:
         threading.Thread(target=self._ping_bg, daemon=True).start()
 
     def _ping_bg(self):
-        alive = ping_once()
+        alive = self.platform.ping_once()
         self.root.after(0, lambda: self.ping_var.set(
             "联网检测：%s" % ("可上网 ✓" if alive else "不通 ✗")))
 
@@ -618,16 +993,16 @@ class NetSwitchApp:
         if not all_mode:
             n = self.adapter_var.get()
             return [n] if n else []
-        if self.phys_only_var.get():
+        if IS_WIN and self.phys_only_var.get():
             picked, skipped = [], []
             for a in self.adapters:
-                if status_kind(a) == "absent":
+                if self.platform.status_kind(a) == "absent":
                     continue
-                (skipped if is_virtual(a) else picked).append(a["name"])
+                (skipped if self.platform.is_virtual(a) else picked).append(a["name"])
             if skipped:
                 self.log_line("已跳过虚拟/隧道网卡：%s" % "、".join(skipped), "warn")
             return picked
-        return [a["name"] for a in self.adapters if status_kind(a) != "absent"]
+        return [a["name"] for a in self.adapters if self.platform.status_kind(a) != "absent"]
 
     def net_toggle(self, enable):
         if not self.ensure_admin():
@@ -657,7 +1032,7 @@ class NetSwitchApp:
         self._busy(True)
         ok_all = True
         for n in names:
-            ok, out = toggle_adapter_smart(n, enable)
+            ok, out = self.platform.set_adapter(n, enable)
             if ok:
                 self.log_line("%s %s：成功" % ("恢复" if enable else "断开", n), "ok")
             else:
@@ -669,7 +1044,6 @@ class NetSwitchApp:
         if not enable and auto_restore and self.auto_var.get() and ok_all:
             self.start_auto_restore(names)
 
-    # ---------------- 自动恢复 ----------------
     def start_auto_restore(self, names):
         try:
             sec = max(3, int(self.auto_sec_var.get() or 30))
@@ -688,7 +1062,7 @@ class NetSwitchApp:
         self.root.after(0, lambda: self.auto_left_var.set("正在自动恢复…"))
         self.log_line("倒计时结束，自动恢复网络", "warn")
         for n in names:
-            toggle_adapter_smart(n, True)
+            self.platform.set_adapter(n, True)
         self.root.after(0, lambda: self.auto_left_var.set(""))
         self.root.after(1000, self.refresh_all)
 
@@ -733,26 +1107,21 @@ class NetSwitchApp:
             rounds += 1
             if cnt and rounds > cnt:
                 break
-            self.root.after(0, lambda r=rounds: self.loop_state_var.set(
-                "第 %d 轮：正在断网 %ds" % (r, off)))
+            self.root.after(0, lambda r=rounds: self.loop_state_var.set("第 %d 轮：正在断网 %ds" % (r, off)))
             self.log_line("循环第 %d 轮 → 断网" % rounds, "warn")
             for n in names:
-                toggle_adapter_smart(n, False)
-            self.root.after(0, lambda r=rounds: self.loop_state_var.set(
-                "第 %d 轮：已断网 %ds" % (r, off)))
+                self.platform.set_adapter(n, False)
+            self.root.after(0, lambda r=rounds: self.loop_state_var.set("第 %d 轮：已断网 %ds" % (r, off)))
             if self._sleep_check(off):
                 break
-
-            self.root.after(0, lambda r=rounds: self.loop_state_var.set(
-                "第 %d 轮：正在恢复 %ds" % (r, on)))
+            self.root.after(0, lambda r=rounds: self.loop_state_var.set("第 %d 轮：正在恢复 %ds" % (r, on)))
             self.log_line("循环第 %d 轮 → 恢复" % rounds, "ok")
             for n in names:
-                toggle_adapter_smart(n, True)
+                self.platform.set_adapter(n, True)
             if self._sleep_check(on):
                 break
-
         for n in names:
-            toggle_adapter_smart(n, True)
+            self.platform.set_adapter(n, True)
         self.root.after(0, lambda: (
             self.btn_loop_start.configure(state="normal"),
             self.btn_loop_stop.configure(state="disabled"),
@@ -762,7 +1131,6 @@ class NetSwitchApp:
         self.root.after(1000, self.refresh_all)
 
     def _sleep_check(self, sec):
-        """可中断的 sleep，返回 True 表示被中断"""
         for _ in range(sec):
             if self._stop_event.is_set():
                 return True
@@ -775,10 +1143,10 @@ class NetSwitchApp:
         self._stop_event.clear()
         self.root.after(0, lambda: self.auto_left_var.set(""))
 
-    # ---------------- 模式三：单应用 ----------------
+    # ---------------- 模式三：单应用（Windows） ----------------
     def pick_exe(self):
-        p = filedialog.askopenfilename(title="选择要控制的程序",
-                                       filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        ftype = [("可执行文件", "*.exe")] if IS_WIN else [("应用程序", "*.app"), ("所有文件", "*.*")]
+        p = filedialog.askopenfilename(title="选择要控制的程序", filetypes=ftype)
         if p:
             self.exe_var.set(p)
 
@@ -788,14 +1156,11 @@ class NetSwitchApp:
         win.geometry("660x440")
         win.transient(self.root)
         win.grab_set()
-
         frame = ttk.Frame(win, padding=10)
         frame.pack(fill="both", expand=True)
         self.root.update_idletasks()
-
         search_var = tk.StringVar()
         ttk.Entry(frame, textvariable=search_var).pack(fill="x", pady=(0, 6))
-
         lst = tk.Listbox(frame, font=("Consolas", 9))
         lst.pack(fill="both", expand=True)
         procs = []
@@ -808,7 +1173,7 @@ class NetSwitchApp:
                     lst.insert("end", "%-28s | %s" % (name, path))
 
         def load():
-            res = list_processes()
+            res = self.platform.list_processes()
             del procs[:]
             procs.extend(res)
             try:
@@ -848,15 +1213,18 @@ class NetSwitchApp:
 
     def _app_block_bg(self, p):
         self._busy(True)
-        ok, detail = block_app(p)
+        ok, detail = self.platform.block_app(p)
         if ok:
             self.cfg["last_exe"] = p
             save_config(self.cfg)
             self.log_line("已阻断：%s（出站+入站）" % p, "ok")
         else:
-            for d, dok, out in detail:
+            out = detail if isinstance(detail, str) else ""
+            for d, dok, o in (detail if isinstance(detail, list) else []):
                 if not dok:
-                    self.log_line("阻断失败(%s)：%s" % (d, (out or "")[-180:].replace("\n", " ")), "err")
+                    self.log_line("阻断失败(%s)：%s" % (d, (o or "")[-180:].replace("\n", " ")), "err")
+            if out:
+                self.log_line("阻断失败：%s" % (out or "")[:200], "err")
         self.root.after(0, self.refresh_block_list)
         self.root.after(500, lambda: self._busy(False))
 
@@ -871,7 +1239,7 @@ class NetSwitchApp:
 
     def _app_unblock_bg(self, p):
         self._busy(True)
-        ok, out = unblock_app(p)
+        ok, out = self.platform.unblock_app(p)
         if ok:
             self.log_line("已放行：%s" % p, "ok")
         else:
@@ -881,9 +1249,11 @@ class NetSwitchApp:
 
     def refresh_block_list(self):
         threading.Thread(target=lambda: self.root.after(
-            0, lambda r=list_netswitch_rules(): self._fill_block_list(r)), daemon=True).start()
+            0, lambda r=self.platform.list_rules(): self._fill_block_list(r)), daemon=True).start()
 
     def _fill_block_list(self, rules):
+        if not hasattr(self, "block_list"):
+            return
         self.block_list.delete(0, "end")
         self.row_map = {}
         self.rules = rules or []
@@ -908,7 +1278,7 @@ class NetSwitchApp:
     def clear_rules(self):
         if not self.ensure_admin():
             return
-        rules = list_netswitch_rules()
+        rules = self.platform.list_rules()
         if not rules:
             messagebox.showinfo("提示", "当前没有需要清理的规则")
             return
@@ -922,23 +1292,99 @@ class NetSwitchApp:
         for r in rules:
             if not r.get("name"):
                 continue
-            ok, _ = delete_rule_by_name(r["name"])
+            ok, _ = self.platform.delete_rule(r["name"])
             if not ok:
                 fail += 1
         self.log_line("清理完成：共 %d 条，失败 %d 条" % (len(rules), fail), "ok" if not fail else "warn")
         self.root.after(0, self.refresh_block_list)
         self.root.after(500, lambda: self._busy(False))
 
+    # ---------------- 模式四：弱网 ----------------
+    def _weak_profile(self):
+        try:
+            return {
+                "dl_kbps": int(self.dl_var.get() or 0),
+                "ul_kbps": int(self.ul_var.get() or 0),
+                "latency_ms": int(self.lat_var.get() or 0),
+                "jitter_ms": int(self.jit_var.get() or 0),
+                "loss_pct": int(self.loss_var.get() or 0),
+                "reorder_pct": int(self.reord_var.get() or 0),
+            }
+        except Exception:
+            return {}
+
+    def weak_start(self):
+        if not self.ensure_admin():
+            return
+        prof = self._weak_profile()
+        if not prof:
+            messagebox.showerror("参数错误", "请填写合法的弱网参数")
+            return
+        self._persist_weak()
+        self.btn_weak_on.configure(state="disabled")
+        self.btn_weak_off.configure(state="normal")
+        self.weak_state_var.set("正在开启弱网…")
+        threading.Thread(target=self._weak_start_bg, args=(prof,), daemon=True).start()
+
+    def _weak_start_bg(self, prof):
+        ok, msg = self.platform.set_weak(prof)
+        self._weak_active = ok
+        self.root.after(0, lambda: self.weak_state_var.set(
+            ("弱网运行中：%s" % self._weak_desc(prof)) if ok else ("开启失败：%s" % msg[:120])))
+        if ok:
+            self.log_line("弱网已开启 · %s" % self._weak_desc(prof), "ok")
+            self.log_line(msg, "info")
+        else:
+            self.log_line("弱网开启失败：%s" % msg, "err")
+            self.root.after(0, lambda: (self.btn_weak_on.configure(state="normal"),
+                                        self.btn_weak_off.configure(state="disabled")))
+
+    def _weak_desc(self, prof):
+        parts = []
+        if prof.get("dl_kbps"):
+            parts.append("下行 %dkbps" % prof["dl_kbps"])
+        if prof.get("ul_kbps"):
+            parts.append("上行 %dkbps" % prof["ul_kbps"])
+        if prof.get("latency_ms"):
+            parts.append("延迟 %dms" % prof["latency_ms"])
+        if prof.get("jitter_ms"):
+            parts.append("抖动 %dms" % prof["jitter_ms"])
+        if prof.get("loss_pct"):
+            parts.append("丢包 %d%%" % prof["loss_pct"])
+        if prof.get("reorder_pct"):
+            parts.append("乱序 %d%%" % prof["reorder_pct"])
+        return "、".join(parts) if parts else "全参数 0（等于不限速）"
+
+    def weak_stop(self):
+        self.weak_state_var.set("正在停止…")
+        threading.Thread(target=self._weak_stop_bg, daemon=True).start()
+
+    def _weak_stop_bg(self):
+        ok, msg = self.platform.clear_weak()
+        self._weak_active = False
+        self.root.after(0, lambda: (self.btn_weak_on.configure(state="normal"),
+                                    self.btn_weak_off.configure(state="disabled"),
+                                    self.weak_state_var.set("弱网已停止" if ok else msg[:120])))
+        self.log_line("弱网已停止：%s" % msg, "ok")
+
+    def refresh_weak_state(self):
+        active = self.platform.weak_active()
+        self._weak_active = active
+        self.root.after(0, lambda: (
+            self.btn_weak_off.configure(state="normal" if active else "disabled"),
+            self.btn_weak_on.configure(state="disabled" if active else "normal"),
+            self.weak_state_var.set("弱网运行中" if active else ""),
+        ))
+
     # ---------------- 权限 ----------------
     def do_elevate(self):
-        if messagebox.askyesno("提权", "将以管理员身份重新启动本程序，当前窗口会关闭。继续？"):
-            if elevate():
+        if messagebox.askyesno("提权", "将以管理员(root)身份重新启动本程序，当前窗口会关闭。继续？"):
+            if self.platform.elevate():
                 self.on_close()
             else:
                 messagebox.showerror("失败", "提权被拒绝或失败")
 
     def create_uac_free(self):
-        """创建计划任务 + 桌面快捷方式，之后双击不再弹 UAC"""
         if getattr(sys, "frozen", False):
             target, args = '"%s"' % sys.executable, ""
         else:
@@ -984,10 +1430,8 @@ class NetSwitchApp:
     def _bind_hotkeys(self):
         def worker():
             try:
-                keyboard.add_hotkey("ctrl+alt+k", lambda: self.root.after(
-                    0, lambda: self.net_toggle(False)))
-                keyboard.add_hotkey("ctrl+alt+r", lambda: self.root.after(
-                    0, lambda: self.net_toggle(True)))
+                keyboard.add_hotkey("ctrl+alt+k", lambda: self.root.after(0, lambda: self.net_toggle(False)))
+                keyboard.add_hotkey("ctrl+alt+r", lambda: self.root.after(0, lambda: self.net_toggle(True)))
                 keyboard.add_hotkey("ctrl+alt+s", lambda: self.root.after(0, self.loop_stop))
                 self.log_line("全局热键已启用：Ctrl+Alt+K 断网 / Ctrl+Alt+R 恢复 / Ctrl+Alt+S 停止", "ok")
                 keyboard.wait()
@@ -998,22 +1442,29 @@ class NetSwitchApp:
     # ---------------- 关闭 ----------------
     def on_close(self):
         self._stop_event.set()
+        try:
+            if self._weak_active:
+                self.platform.clear_weak()
+        except Exception:
+            pass
         self._persist_opts()
+        self._persist_weak()
         self.root.destroy()
 
 
 def main():
     root = tk.Tk()
     app = NetSwitchApp(root)
-    app.log_line("启动完成，权限：%s" % ("管理员" if is_admin() else "普通用户（开关网络会失败）"),
-                 "ok" if is_admin() else "warn")
-    if not is_admin():
+    admin = app.platform.is_admin()
+    app.log_line("启动完成，权限：%s" % ("管理员/root" if admin else "普通用户（开关网络会失败）"),
+                 "ok" if admin else "warn")
+    if not admin:
         root.after(300, lambda: messagebox.showwarning(
             "建议以管理员运行",
-            "当前不是管理员身份，网卡开关和防火墙规则都会失败。\n\n"
-            "可关闭后右键「以管理员身份运行」，或点右下角「以管理员重启」。"))
+            "当前不是管理员/root 身份，网卡开关、弱网等操作都会失败。\n\n"
+            "可关闭后右键「以管理员身份运行」，或点右下角「以管理员/root 重启」。"))
     last = app.cfg.get("last_exe")
-    if last:
+    if last and app.platform.app_block_supported():
         app.exe_var.set(last)
     root.mainloop()
 

@@ -1,36 +1,46 @@
-# NetSwitch · PC 网络控制开关
+# NetSwitch
 
-给测试工作用的一键网络开关，避免反复拔网线 / 关 WiFi。三种模式互不干扰。
+跨平台网络控制开关，给测试工作用。一键整机断网 / 循环断网 / 单应用断网 / 弱网模拟。
 
-- `netswitch.py` — 主程序源码（Python 3.11 + tkinter）
-- `NetSwitch.exe` — 打包好的可执行文件，免 Python 环境，直接以管理员运行
-- `使用说明.md` — 完整使用说明
-- `upload_to_github.py` — 把本项目同步到 GitHub 的工具脚本
+## 功能
 
-## 三种模式
+| 模式 | 说明 | Windows | macOS |
+|---|---|:---:|:---:|
+| 一 · 整机断网 | 禁用/启用网卡 | ✅ | ✅ |
+| 二 · 循环断网 | 断 X 秒→连 Y 秒，模拟抖动 | ✅ | ✅ |
+| 三 · 单应用断网 | 只掐一个 exe 的网络 | ✅ | ❌（系统限制） |
+| 四 · 弱网模拟 | 带宽/延迟/丢包/抖动/乱序 | ✅ WinDivert | ✅ dummynet |
 
-| 模式 | 干什么 | 适用场景 |
-|---|---|---|
-| 整机断网 | 禁用/启用网卡，等价于拔网线 | 测整体离线表现 |
-| 循环断网 | 断 X 秒 → 连 Y 秒 → 重复 N 轮 | 测断线重连、超时重试、状态机恢复 |
-| 单应用断网 | 只掐某个 exe，其他软件照常上网 | 整机不下线，单独验证某个客户端 |
+> macOS dummynet 只支持带宽/延迟/丢包；抖动、乱序仅 Windows 有效。
 
-## 直接下载使用
+## 平台
 
-`NetSwitch.exe` 已入库，下载后**右键 → 以管理员身份运行**（非管理员无法开关网卡）。
-首次以管理员运行后点「创建免UAC快捷方式」，以后双击不再弹 UAC。
+- **Windows**：需管理员，`NetSwitch.exe`（见仓库根目录或 Release）
+- **macOS**：需 root，`NetSwitch.app`（Release 里的 `NetSwitch.dmg`，未签名）
 
-## 重新打包
+## 弱网实现
 
-需要**带 tkinter 的 Python 环境**（注：某些精简 Python 发行版不含 tkinter）：
+- Windows：`pydivert`（自带 WinDivert 驱动），系统级对所有包限速/延迟/丢包/乱序
+- macOS：`pfctl` + `dnctl`（dummynet），系统原生，无需额外工具
 
-```bat
-pyinstaller --noconfirm --onefile --windowed --clean --name NetSwitch ^
-  --hidden-import=keyboard --hidden-import=win32com.client netswitch.py
+## 构建
+
+```bash
+# Windows（带 tkinter 的 Python）
+pyinstaller --noconfirm --onefile --windowed --name NetSwitch ^
+  --hidden-import=keyboard --hidden-import=win32com.client --hidden-import=pydivert netswitch.py
+
+# macOS（本机 Mac）
+bash build_mac.sh
+bash create_dmg.sh
 ```
 
-## 已知注意
+或用 GitHub Actions 自动出 DMG（`.github/workflows/build-mac.yml`，产物在 Release）。
 
-- 防火墙规则只对新连接生效，已建立的长连接建议重启被测程序再验证
-- 批量断网默认跳过 Hyper-V / WSL / Docker / VMware 等虚拟网卡
-- 断网后远程桌面会断开，远程机器建议用「单应用断网」模式
+## 注意
+
+- 弱网对所有流量生效，停止后恢复。
+- DMG 未签名：首次打开右键 → 打开，或 `xattr -d com.apple.quarantine /Applications/NetSwitch.app`。
+- 详细使用见 [使用说明.md](使用说明.md)。
+
+版本 v2.0.0 · Python 3.11 + tkinter
