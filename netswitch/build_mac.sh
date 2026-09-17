@@ -3,16 +3,19 @@
 # 用法： bash build_mac.sh
 set -e
 cd "$(dirname "$0")"
-exec > >(tee build_log.txt) 2>&1
 
 APP_NAME=NetSwitch
 PYTHON="${PYTHON:-python3}"
+
+echo "==> 基础 python: $PYTHON -> $("$PYTHON" --version 2>&1)"
 
 echo "==> 创建虚拟环境（隔离 pyinstaller，避免系统/用户 site 路径打架）"
 VENV="build/venv"
 "$PYTHON" -m venv "$VENV"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
+echo "venv python: $(which python)"
+echo "venv pip: $(python -m pip --version)"
 
 echo "==> 安装依赖"
 python -m pip install --upgrade pip pyinstaller

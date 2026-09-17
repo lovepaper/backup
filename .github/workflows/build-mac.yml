@@ -31,7 +31,7 @@ jobs:
         working-directory: netswitch
         env:
           PYTHON: ${{ steps.setup-python.outputs.python-path }}
-        run: bash build_mac.sh
+        run: bash build_mac.sh 2>&1 | tee build_log.txt; test ${PIPESTATUS[0]} -eq 0
 
       - name: Create DMG
         working-directory: netswitch
