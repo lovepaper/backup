@@ -2,6 +2,7 @@
 # NetSwitch macOS 打包脚本（在本机 Mac 上运行）
 # 用法： bash build_mac.sh
 # 注意：CI 中由 setup-python 的 Python 运行（PYTHON 环境变量传入），用 venv 隔离依赖
+# CI build: 用 --system-site-packages venv 继承系统已装的 pyinstaller / tkinter
 set -e
 cd "$(dirname "$0")"
 
