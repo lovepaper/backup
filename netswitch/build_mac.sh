@@ -26,6 +26,11 @@ python -m pip install --force-reinstall --no-deps pyinstaller
 python -m pip show pyinstaller | head -3
 python -c "import tkinter; print('tkinter OK')"
 
+echo "--- 诊断 venv sys.path / pyinstaller 落点 ---"
+python -c "import sys; print('SYS_PATH:'); [print('  ', p) for p in sys.path]"
+python -m pip show -f pyinstaller 2>/dev/null | grep -i -E "location|pyinstaller/__init__" | head
+echo "venv site 内容:"; ls -la build/venv/lib/python3.11/site-packages/ 2>/dev/null | grep -i pyinstaller || echo "  (venv site 无 pyinstaller)"
+
 echo "==> PyInstaller 打包 .app"
 python -m pyinstaller --noconfirm --windowed --name "$APP_NAME" \
   --osx-bundle-identifier com.netswitch.app \
