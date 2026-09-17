@@ -20,7 +20,10 @@ echo "venv python: $(which python)"
 echo "venv pip: $(python -m pip --version)"
 
 echo "==> 安装依赖"
-python -m pip install --upgrade pip pyinstaller
+python -m pip install --upgrade pip
+# 关键：必须强制装进 venv 自己的 site-packages，否则 venv 运行时找不到系统已有的 pyinstaller
+python -m pip install --force-reinstall --no-deps pyinstaller
+python -m pip show pyinstaller | head -3
 python -c "import tkinter; print('tkinter OK')"
 
 echo "==> PyInstaller 打包 .app"
