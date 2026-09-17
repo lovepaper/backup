@@ -3,6 +3,7 @@
 # 用法： bash build_mac.sh
 set -e
 cd "$(dirname "$0")"
+exec > >(tee build_log.txt) 2>&1
 
 APP_NAME=NetSwitch
 PYTHON="${PYTHON:-python3}"
