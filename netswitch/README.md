@@ -15,8 +15,16 @@
 
 ## 平台
 
-- **Windows**：需管理员，`NetSwitch.exe`（见仓库根目录或 Release）
-- **macOS**：需 root，`NetSwitch.app`（Release 里的 `NetSwitch.dmg`，未签名）
+- **Windows**：需管理员，`NetSwitch.exe`（`netswitch/` 目录下，或重新打包）
+- **macOS**：需 root，`NetSwitch.app`（`NetSwitch.dmg`，Release `netswitch-macos`，未签名）
+
+## 下载
+
+- **macOS DMG**（未签名）：https://github.com/lovepaper/backup/releases/download/netswitch-macos/NetSwitch.dmg
+  （Release 页面：https://github.com/lovepaper/backup/releases/tag/netswitch-macos）
+- **Windows exe**：见仓库 `netswitch/NetSwitch.exe`
+
+> 公开仓库，`netswitch/` 子目录含全部源码与脚本，可 `git clone` 后按"构建"一节本地打包。
 
 ## 弱网实现
 

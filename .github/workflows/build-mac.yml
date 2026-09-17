@@ -45,17 +45,3 @@ jobs:
           gh release create netswitch-macos netswitch/NetSwitch.dmg \
             --title "NetSwitch macOS" \
             --notes "自动构建（未签名）。下载后右键 → 打开，或在终端执行：xattr -d com.apple.quarantine NetSwitch.dmg"
-
-      # 调试用：把构建日志推到 ci-logs 分支，便于无 actions 权限时排查（平时可删）
-      - name: Dump build log (debug)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.email "ci@netswitch.local"
-          git config user.name "NetSwitch CI"
-          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/lovepaper/backup.git
-          cp netswitch/build_log.txt ./ci_build_log.txt 2>/dev/null || printf 'NO LOG FILE' > ci_build_log.txt
-          git add ci_build_log.txt
-          git commit -m "ci: build log [skip ci]" || true
-          git push --force origin HEAD:ci-logs || true
