@@ -8,12 +8,18 @@ exec > >(tee build_log.txt) 2>&1
 APP_NAME=NetSwitch
 PYTHON="${PYTHON:-python3}"
 
+echo "==> 创建虚拟环境（隔离 pyinstaller，避免系统/用户 site 路径打架）"
+VENV="build/venv"
+"$PYTHON" -m venv "$VENV"
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+
 echo "==> 安装依赖"
-"$PYTHON" -m pip install --upgrade pip pyinstaller
-"$PYTHON" -c "import tkinter; print('tkinter OK')"
+python -m pip install --upgrade pip pyinstaller
+python -c "import tkinter; print('tkinter OK')"
 
 echo "==> PyInstaller 打包 .app"
-"$PYTHON" -m pyinstaller --noconfirm --windowed --name "$APP_NAME" \
+python -m pyinstaller --noconfirm --windowed --name "$APP_NAME" \
   --osx-bundle-identifier com.netswitch.app \
   --exclude-module windivert_throttle --exclude-module pydivert \
   --exclude-module win32com --exclude-module win32api --exclude-module win32gui \
