@@ -29,6 +29,8 @@ jobs:
 
       - name: Build .app
         working-directory: netswitch
+        env:
+          PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: bash build_mac.sh
 
       - name: Create DMG
