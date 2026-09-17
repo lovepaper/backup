@@ -12,7 +12,7 @@ echo "==> 基础 python: $PYTHON -> $("$PYTHON" --version 2>&1)"
 
 echo "==> 创建虚拟环境（隔离 pyinstaller，避免系统/用户 site 路径打架）"
 VENV="build/venv"
-"$PYTHON" -m venv "$VENV"
+"$PYTHON" -m venv --system-site-packages "$VENV"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 echo "venv python: $(which python)"

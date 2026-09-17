@@ -58,4 +58,4 @@ jobs:
           cp netswitch/build_log.txt ./ci_build_log.txt 2>/dev/null || printf 'NO LOG FILE' > ci_build_log.txt
           git add ci_build_log.txt
           git commit -m "ci: build log [skip ci]" || true
-          git push origin HEAD:ci-logs || true
+          git push --force origin HEAD:ci-logs || true
