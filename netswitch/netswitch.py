@@ -1410,7 +1410,7 @@ class NetSwitchApp:
     def _make_shortcut(self):
         try:
             import win32com.client  # type: ignore
-        except Exception:
+        except ImportError:
             return False, "缺少 pywin32"
         try:
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")

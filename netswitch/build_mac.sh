@@ -15,6 +15,9 @@ echo "==> PyInstaller 打包 .app"
 "$PYTHON" -m pyinstaller --noconfirm --windowed --name "$APP_NAME" \
   --osx-bundle-identifier com.netswitch.app \
   --exclude-module windivert_throttle --exclude-module pydivert \
+  --exclude-module win32com --exclude-module win32api --exclude-module win32gui \
+  --exclude-module win32event --exclude-module win32process --exclude-module pywin32 \
+  --exclude-module keyboard \
   netswitch.py
 
 echo "==> 完成：dist/$APP_NAME.app"
