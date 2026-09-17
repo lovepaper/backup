@@ -36,4 +36,16 @@ pyinstaller --noconfirm --windowed --name "$APP_NAME" \
   --exclude-module keyboard \
   netswitch.py
 
+echo "==> 清理扩展属性（避免 quarantine 误判导致 🚫）"
+xattr -cr "dist/$APP_NAME.app" || true
+
+echo "==> 确保可执行位"
+chmod +x "dist/$APP_NAME.app/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+
+echo "==> ad-hoc 签名（无 Apple 证书也能让 Gatekeeper 接受，消除『已损坏/🚫』）"
+codesign --force --deep --sign - "dist/$APP_NAME.app" || true
+echo "==> 签名校验："
+codesign -vvv "dist/$APP_NAME.app" 2>&1 || true
+spctl --assess -vv "dist/$APP_NAME.app" 2>&1 || true
+
 echo "==> 完成：dist/$APP_NAME.app"
