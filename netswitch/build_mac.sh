@@ -23,16 +23,12 @@ echo "==> 安装依赖"
 python -m pip install --upgrade pip
 # 关键：必须强制装进 venv 自己的 site-packages，否则 venv 运行时找不到系统已有的 pyinstaller
 python -m pip install --force-reinstall --no-deps pyinstaller
-python -m pip show pyinstaller | head -3
 python -c "import tkinter; print('tkinter OK')"
 
-echo "--- 诊断 venv sys.path / pyinstaller 落点 ---"
-python -c "import sys; print('SYS_PATH:'); [print('  ', p) for p in sys.path]"
-python -m pip show -f pyinstaller 2>/dev/null | grep -i -E "location|pyinstaller/__init__" | head
-echo "venv site 内容:"; ls -la build/venv/lib/python3.11/site-packages/ 2>/dev/null | grep -i pyinstaller || echo "  (venv site 无 pyinstaller)"
-
 echo "==> PyInstaller 打包 .app"
-python -m pyinstaller --noconfirm --windowed --name "$APP_NAME" \
+# 注意：macOS 文件系统大小写敏感，pyinstaller 包名实为 PyInstaller（大写）。
+# 不能用 `python -m pyinstaller`（小写找不到），必须用 venv 的 pyinstaller 命令。
+pyinstaller --noconfirm --windowed --name "$APP_NAME" \
   --osx-bundle-identifier com.netswitch.app \
   --exclude-module windivert_throttle --exclude-module pydivert \
   --exclude-module win32com --exclude-module win32api --exclude-module win32gui \
