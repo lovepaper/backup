@@ -29,6 +29,7 @@ echo "==> PyInstaller 打包 .app"
 # 注意：macOS 文件系统大小写敏感，pyinstaller 包名实为 PyInstaller（大写）。
 # 不能用 `python -m pyinstaller`（小写找不到），必须用 venv 的 pyinstaller 命令。
 pyinstaller --noconfirm --windowed --name "$APP_NAME" \
+  --target-arch x86_64 \
   --osx-bundle-identifier com.netswitch.app \
   --exclude-module windivert_throttle --exclude-module pydivert \
   --exclude-module win32com --exclude-module win32api --exclude-module win32gui \
