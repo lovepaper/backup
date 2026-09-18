@@ -100,7 +100,7 @@ do_status() {
         echo "  弱网生效中:"
         printf '%s\n' "$rules" | sed 's/^/    /'
         echo "  管道配置:"
-        dnctl -q show 2>/dev/null | sed 's/^/    /'
+        dnctl show 2>/dev/null | sed 's/^/    /'
     else
         echo "  未开启"
     fi
@@ -147,6 +147,51 @@ cfg_pipe() {  # $1=管道号 $2=带宽Kbit $3=延迟ms $4=丢包%
     dnctl $args >/dev/null 2>&1
 }
 
+# 生成 pf 弱网规则并加载。
+# 注意：不能写 "proto ip" —— ip 在 /etc/protocols 里是协议号 0，pf 会报
+# "proto 0 cannot be used"。这里准备 3 种写法逐个尝试，取第一个能加载的。
+# $1=出站管道号  $2=入站管道号
+load_pf_rules() {
+    local out_pipe="$1" in_pipe="$2"
+    local v body out rc
+    for v in 1 2 3; do
+        case "$v" in
+            1)  # 不指定 proto（最通用，Apple 官方示例写法）
+                body="dummynet out from any to any pipe ${out_pipe}
+dummynet in from any to any pipe ${in_pipe}" ;;
+            2)  # 只匹配 tcp/udp
+                body="dummynet out proto { tcp, udp } from any to any pipe ${out_pipe}
+dummynet in proto { tcp, udp } from any to any pipe ${in_pipe}" ;;
+            3)  # all
+                body="dummynet out all from any to any pipe ${out_pipe}
+dummynet in all from any to any pipe ${in_pipe}" ;;
+        esac
+        printf '%s\n' "$body" > "$PF_CONF"
+        out=$(pfctl -a "$ANCHOR" -f "$PF_CONF" 2>&1); rc=$?
+        if [ $rc -eq 0 ]; then
+            PF_VARIANT="$v"
+            return 0
+        fi
+        LAST_PF_ERR="$out"
+    done
+    return 1
+}
+
+# 启用 pf。已启用时 pfctl -e 返回 rc=1 并提示 "already enabled"，不算失败。
+ensure_pf_enabled() {
+    local out rc
+    out=$(pfctl -e 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
+        return 0
+    fi
+    if printf '%s' "$out" | grep -qi "already enabled"; then
+        return 0
+    fi
+    echo "启用 pf 失败 (rc=$rc): $out"
+    echo "这台机器可能不允许改 pf（公司管控 / 系统完整性限制），弱网功能不可用。"
+    return 1
+}
+
 do_weak_on() {
     local dl ul lat loss
     printf '下行限速 Kbit/s  [回车=500]: '; read -r dl; dl=${dl:-500}
@@ -155,28 +200,23 @@ do_weak_on() {
     printf '丢包 %%           [回车=10] : '; read -r loss; loss=${loss:-10}
     case "$dl$ul$lat$loss" in *[!0-9]*) echo "参数必须是数字"; return ;; esac
 
-    # 启用 pf：保留输出，失败时能看到真实原因
-    local out rc
-    out=$(pfctl -e 2>&1); rc=$?
-    if [ $rc -ne 0 ]; then
-        echo "启用 pf 失败 (rc=$rc): $out"
-        echo "这台机器可能不允许改 pf（公司管控/系统完整性限制），弱网功能不可用。"
-        return
-    fi
+    ensure_pf_enabled || return
 
     cfg_pipe 1 "$ul" "$lat" "$loss"   # pipe1 = 出站(上行)
     cfg_pipe 2 "$dl" "$lat" "$loss"   # pipe2 = 入站(下行)
 
-    printf 'dummynet out proto ip from any to any pipe 1\ndummynet in proto ip from any to any pipe 2\n' > "$PF_CONF"
-    out=$(pfctl -a "$ANCHOR" -f "$PF_CONF" 2>&1); rc=$?
-    if [ $rc -eq 0 ]; then
+    if load_pf_rules 1 2; then
         echo "弱网已开启: 下行 ${dl}Kbit/s · 上行 ${ul}Kbit/s · 延迟 ${lat}ms · 丢包 ${loss}%"
         echo "（系统级，对所有流量生效；关闭请选菜单 5）"
+        echo "生效规则:"
+        pfctl -a "$ANCHOR" -s rules 2>/dev/null | sed 's/^/    /'
+        echo "管道:"
+        dnctl show 2>/dev/null | sed 's/^/    /'
     else
-        echo "加载 pf 规则失败 (rc=$rc):"
-        echo "  $out"
+        echo "加载 pf 规则失败:"
+        echo "  $LAST_PF_ERR"
         echo "  uid=$(id -u)  pfctl=$(command -v pfctl)  dnctl=$(command -v dnctl)"
-        echo "常见原因: 未用 sudo 运行 / pf 被系统策略禁用 / dnctl 不可用。选 8 看诊断。"
+        echo "选 8 看逐项诊断（会试遍 3 种规则写法并给出真实报错）。"
     fi
 }
 
@@ -222,12 +262,29 @@ do_diag() {
     echo "-- dnctl pipe --"
     out=$(dnctl pipe 1 config bw 500Kbit 2>&1); rc=$?
     echo "  rc=$rc  out=$out"
-    echo "-- 加载 pf 锚点规则 --"
-    printf 'dummynet out proto ip from any to any pipe 1\ndummynet in proto ip from any to any pipe 2\n' > "$PF_CONF"
-    out=$(pfctl -a "$ANCHOR" -f "$PF_CONF" 2>&1); rc=$?
-    echo "  rc=$rc  out=$out"
-    echo "-- 查询已加载规则 --"
+    echo "-- 管道配置测试 --"
+    out=$(dnctl pipe 1 config bw 500Kbit delay 100 plr 0.1000 2>&1); rc=$?
+    echo "  pipe1 rc=$rc out=$out"
+    out=$(dnctl pipe 2 config bw 500Kbit delay 100 plr 0.1000 2>&1); rc=$?
+    echo "  pipe2 rc=$rc out=$out"
+    echo "-- pf 规则写法逐个尝试 --"
+    local v
+    for v in 1 2 3; do
+        case "$v" in
+            1) printf 'dummynet out from any to any pipe 1\ndummynet in from any to any pipe 2\n' > "$PF_CONF" ;;
+            2) printf 'dummynet out proto { tcp, udp } from any to any pipe 1\ndummynet in proto { tcp, udp } from any to any pipe 2\n' > "$PF_CONF" ;;
+            3) printf 'dummynet out all from any to any pipe 1\ndummynet in all from any to any pipe 2\n' > "$PF_CONF" ;;
+        esac
+        echo "  [写法$v] $(head -1 "$PF_CONF")"
+        out=$(pfctl -a "$ANCHOR" -f "$PF_CONF" 2>&1); rc=$?
+        echo "    rc=$rc  out=$out"
+        [ $rc -eq 0 ] && break
+    done
+    echo "-- 已加载规则 --"
     pfctl -a "$ANCHOR" -s rules 2>&1 | sed 's/^/  /'
+    echo "-- 流量是否真的过管道（ping 一次后看计数器）--"
+    ping -c 3 -t 2 "$PING_HOST" >/dev/null 2>&1
+    dnctl -q show 2>/dev/null | sed 's/^/  /'
     echo "-- pf 状态 --"
     pfctl -s info 2>&1 | head -5 | sed 's/^/  /'
     echo
