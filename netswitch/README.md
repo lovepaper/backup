@@ -48,7 +48,7 @@ bash create_dmg.sh
 ## 注意
 
 - 弱网对所有流量生效，停止后恢复。
-- DMG 未签名：首次打开右键 → 打开，或 `xattr -d com.apple.quarantine /Applications/NetSwitch.app`。
+- DMG 为 ad-hoc 签名（无 Apple 开发者证书）：首次打开右键 → 打开即可；若仍被拦，`xattr -dr com.apple.quarantine /Applications/NetSwitch.app`。
 - 详细使用见 [使用说明.md](使用说明.md)。
 
 版本 v2.0.0 · Python 3.11 + tkinter
