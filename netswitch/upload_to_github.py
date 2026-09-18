@@ -83,7 +83,8 @@ root_files = []     # [(仓库内完整路径, 字节内容)] —— 不走 PREF
 
 # 本地真实文件（含 exe）
 for local_name in ("netswitch.py", "windivert_throttle.py", "使用说明.md",
-                   "NetSwitch.exe", "build_mac.sh", "create_dmg.sh"):
+                   "NetSwitch.exe", "build_mac.sh", "create_dmg.sh",
+                   "netswitch_cli.sh"):
     p = os.path.join(SRC_DIR, local_name)
     if os.path.exists(p):
         files.append((rpath(local_name), open(p, "rb").read()))
