@@ -44,4 +44,4 @@ jobs:
           gh release delete netswitch-macos -y || true
           gh release create netswitch-macos netswitch/NetSwitch.dmg \
             --title "NetSwitch macOS" \
-            --notes "自动构建（未签名）。下载后右键 → 打开，或在终端执行：xattr -d com.apple.quarantine NetSwitch.dmg"
+            --notes "自动构建（Intel x86_64，ad-hoc 签名）。下载后双击挂载 → 拖入应用程序；首次打开若被拦，右键 NetSwitch.app → 打开。"
