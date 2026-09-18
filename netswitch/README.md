@@ -52,3 +52,5 @@ bash create_dmg.sh
 - 详细使用见 [使用说明.md](使用说明.md)。
 
 版本 v2.0.0 · Python 3.11 + tkinter
+
+<!-- intel-build 2026-09-18 14:37 -->
