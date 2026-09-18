@@ -155,16 +155,28 @@ do_weak_on() {
     printf '丢包 %%           [回车=10] : '; read -r loss; loss=${loss:-10}
     case "$dl$ul$lat$loss" in *[!0-9]*) echo "参数必须是数字"; return ;; esac
 
-    pfctl -e >/dev/null 2>&1     # 启用 pf（已启用会提示，忽略）
+    # 启用 pf：保留输出，失败时能看到真实原因
+    local out rc
+    out=$(pfctl -e 2>&1); rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "启用 pf 失败 (rc=$rc): $out"
+        echo "这台机器可能不允许改 pf（公司管控/系统完整性限制），弱网功能不可用。"
+        return
+    fi
+
     cfg_pipe 1 "$ul" "$lat" "$loss"   # pipe1 = 出站(上行)
     cfg_pipe 2 "$dl" "$lat" "$loss"   # pipe2 = 入站(下行)
 
     printf 'dummynet out proto ip from any to any pipe 1\ndummynet in proto ip from any to any pipe 2\n' > "$PF_CONF"
-    if pfctl -a "$ANCHOR" -f "$PF_CONF" >/dev/null 2>&1; then
+    out=$(pfctl -a "$ANCHOR" -f "$PF_CONF" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
         echo "弱网已开启: 下行 ${dl}Kbit/s · 上行 ${ul}Kbit/s · 延迟 ${lat}ms · 丢包 ${loss}%"
         echo "（系统级，对所有流量生效；关闭请选菜单 5）"
     else
-        echo "加载 pf 规则失败（需要 root，请确认用 sudo 运行）"
+        echo "加载 pf 规则失败 (rc=$rc):"
+        echo "  $out"
+        echo "  uid=$(id -u)  pfctl=$(command -v pfctl)  dnctl=$(command -v dnctl)"
+        echo "常见原因: 未用 sudo 运行 / pf 被系统策略禁用 / dnctl 不可用。选 8 看诊断。"
     fi
 }
 
@@ -191,6 +203,37 @@ do_loop() {
     done
 }
 
+do_diag() {
+    echo "== 权限 =="
+    echo "  uid=$(id -u)  (\"0\" 表示 root)"
+    echo "  whoami: $(whoami)"
+    echo
+    echo "== 命令是否存在 =="
+    local c
+    for c in pfctl dnctl networksetup ping awk; do
+        printf '  %-14s %s\n' "$c" "$(command -v "$c" || echo '缺失!')"
+    done
+    echo
+    echo "== 逐个测试（带真实报错）=="
+    echo "-- pfctl -e --"
+    local out rc
+    out=$(pfctl -e 2>&1); rc=$?
+    echo "  rc=$rc  out=$out"
+    echo "-- dnctl pipe --"
+    out=$(dnctl pipe 1 config bw 500Kbit 2>&1); rc=$?
+    echo "  rc=$rc  out=$out"
+    echo "-- 加载 pf 锚点规则 --"
+    printf 'dummynet out proto ip from any to any pipe 1\ndummynet in proto ip from any to any pipe 2\n' > "$PF_CONF"
+    out=$(pfctl -a "$ANCHOR" -f "$PF_CONF" 2>&1); rc=$?
+    echo "  rc=$rc  out=$out"
+    echo "-- 查询已加载规则 --"
+    pfctl -a "$ANCHOR" -s rules 2>&1 | sed 's/^/  /'
+    echo "-- pf 状态 --"
+    pfctl -s info 2>&1 | head -5 | sed 's/^/  /'
+    echo
+    echo "把以上输出整段发出来即可定位。"
+}
+
 do_cleanup() {
     restore_silent
     do_weak_off
@@ -199,7 +242,8 @@ do_cleanup() {
 
 # ---------- 入口 ----------
 
-if [ "$EUID" -ne 0 ]; then
+# 用 id -u 判断，避免某些 shell 下 $EUID 为空导致检查被跳过
+if [ "$(id -u)" != "0" ]; then
     echo "需要 root 权限（改网卡/限速都要）。请这样运行："
     echo "    sudo bash $0"
     exit 1
@@ -219,6 +263,7 @@ while :; do
     echo "  5) 关闭弱网"
     echo "  6) 循环断网（断 N 秒/通 N 秒，模拟抖动）"
     echo "  7) 一键还原（恢复网卡 + 关弱网）"
+    echo "  8) 诊断（打印权限/命令/真实报错，排障用）"
     echo "  0) 退出"
     echo "------------------------------------------"
     printf '选择: '
@@ -231,6 +276,7 @@ while :; do
         5) do_weak_off ;;
         6) do_loop ;;
         7) do_cleanup ;;
+        8) do_diag ;;
         0) do_weak_off >/dev/null 2>&1; restore_silent; echo "bye"; exit 0 ;;
         *) echo "无效选择" ;;
     esac
