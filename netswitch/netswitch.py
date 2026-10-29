@@ -625,10 +625,10 @@ class NetSwitchApp:
         st.configure("TSpinbox", font=FONT)
 
     def _card(self):
-        return ttk.Frame(self.root, style="Card.TFrame", padding=14)
+        return ttk.Frame(self._scroll_inner, style="Card.TFrame", padding=14)
 
     def _build_ui(self):
-        top = self._card()
+        top = ttk.Frame(self.root, style="Card.TFrame", padding=14)
         top.pack(fill="x", padx=12, pady=(12, 6))
         ttk.Label(top, text="%s   %s 网络控制开关" % (APP_NAME, "macOS" if IS_MAC else "PC"),
                   style="Title.TLabel").pack(side="left")
@@ -636,6 +636,8 @@ class NetSwitchApp:
         self.admin_lbl = ttk.Label(top, textvariable=self.admin_var, style="Muted.TLabel")
         self.admin_lbl.pack(side="right")
         ttk.Label(top, text="v%s" % APP_VERSION, style="Muted.TLabel").pack(side="right", padx=(0, 12))
+
+        self._build_scroll_body()
 
         self._build_net_card()
         self._build_loop_card()
@@ -657,6 +659,33 @@ class NetSwitchApp:
         self.btn_elevate = ttk.Button(bot, text="以管理员重启" if IS_WIN else "以 root 重启",
                                       command=self.do_elevate)
         self.btn_elevate.pack(side="right", padx=(0, 8))
+
+    def _build_scroll_body(self):
+        """可滚动主体：所有功能卡片放进这里，窗口再小也能滚到弱网卡。"""
+        body = ttk.Frame(self.root, style="TFrame")
+        body.pack(fill="both", expand=True, padx=0, pady=0)
+        self._canvas = tk.Canvas(body, bg=self.BG, highlightthickness=0)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(body, orient="vertical", command=self._canvas.yview)
+        sb.pack(side="right", fill="y")
+        self._canvas.configure(yscrollcommand=sb.set)
+        inner = ttk.Frame(self._canvas, style="TFrame")
+        self._scroll_inner = inner
+        self._scroll_win = self._canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: self._canvas.configure(
+            scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+        inner.bind("<MouseWheel>", self._on_mousewheel)
+
+    def _on_canvas_configure(self, e):
+        self._canvas.itemconfig(self._scroll_win, width=e.width)
+
+    def _on_mousewheel(self, e):
+        if IS_MAC:
+            self._canvas.yview_scroll(-1 * int(e.delta), "units")
+        else:
+            self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
     def _build_net_card(self):
         c = self._card()
@@ -759,7 +788,7 @@ class NetSwitchApp:
 
         ttk.Label(c, text="已被 NetSwitch 阻断的程序（双击可反填到输入框）：",
                   style="Card.TLabel").pack(anchor="w")
-        self.block_list = tk.Listbox(self.root, height=4, font=("Consolas", 9),
+        self.block_list = tk.Listbox(c, height=4, font=("Consolas", 9),
                                      relief="solid", borderwidth=1, bg="#ffffff", fg=self.FG)
         self.block_list.pack(fill="x", padx=26, pady=(2, 6))
         self.block_list.bind("<Double-Button-1>", self.on_block_dbl)
@@ -846,7 +875,7 @@ class NetSwitchApp:
 
     def _build_log_card(self):
         c = self._card()
-        c.pack(fill="both", expand=True, padx=12, pady=6)
+        c.pack(fill="x", padx=12, pady=6)
         ttk.Label(c, text="运行日志", style="Title.TLabel").pack(anchor="w")
         self.log = tk.Text(c, height=8, font=("Consolas", 9), relief="solid", borderwidth=1,
                            bg="#ffffff", fg=self.FG, wrap="word")
